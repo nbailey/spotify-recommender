@@ -76,6 +76,7 @@ def get_playlist_tracks(sp, playlist_id):
                     "uri": track["uri"],
                     "name": track["name"],
                     "artists": [a["name"] for a in track.get("artists", [])],
+                    "popularity": track.get("popularity", 0),
                 })
         results = sp.next(results) if results.get("next") else None
 
@@ -92,7 +93,7 @@ def search_public_playlists(sp, track, limit=5):
         return []
 
 
-def discover_playlists(sp, input_tracks, search_results_per_track=5):
+def discover_playlists(sp, input_tracks, search_results_per_track=20):
     """
     Phase 1: Broad search to discover candidate playlists.
 
@@ -145,7 +146,7 @@ def score_playlist(input_track_ids, input_artist_by_track, playlist_tracks):
 
 
 def find_recommendations(sp, input_tracks, fetch_limit=50,
-                         search_results_per_track=5):
+                         search_results_per_track=20, max_popularity=80):
     """
     Find recommended songs using a two-phase approach:
 
@@ -159,6 +160,10 @@ def find_recommendations(sp, input_tracks, fetch_limit=50,
     precise overlap score using the exponential artist-diversity formula:
         score = matching_tracks * (distinct_matching_artists ^ 2)
     Weight each candidate song by the score of the playlist it came from.
+
+    Songs with a Spotify popularity score above max_popularity are excluded
+    from recommendations (popularity is a 0-100 score based on recent
+    streaming volume; 80+ generally indicates mainstream hits).
     """
     input_track_ids = {t["id"] for t in input_tracks}
     # Map track ID -> primary artist name for diversity scoring
@@ -204,7 +209,7 @@ def find_recommendations(sp, input_tracks, fetch_limit=50,
             continue
 
         for t in pl_tracks:
-            if t["id"] not in input_track_ids:
+            if t["id"] not in input_track_ids and t["popularity"] <= max_popularity:
                 candidate_scores[t["id"]] += score
                 candidate_info[t["id"]] = t
 
@@ -257,8 +262,14 @@ def main():
     parser.add_argument(
         "--search-results-per-track",
         type=int,
-        default=5,
-        help="Number of playlist results per track search (default: 5)",
+        default=20,
+        help="Number of playlist results per track search (default: 20)",
+    )
+    parser.add_argument(
+        "--max-popularity",
+        type=int,
+        default=80,
+        help="Exclude songs with Spotify popularity above this threshold, 0-100 (default: 80)",
     )
     args = parser.parse_args()
 
@@ -282,6 +293,7 @@ def main():
         sp, input_tracks,
         fetch_limit=args.fetch_limit,
         search_results_per_track=args.search_results_per_track,
+        max_popularity=args.max_popularity,
     )
 
     if not candidate_scores:
