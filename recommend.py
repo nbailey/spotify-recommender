@@ -8,7 +8,7 @@ frequently appear alongside your favorites in other people's playlists
 are likely good recommendations.
 
 Usage:
-    python recommend.py <playlist_url_or_id> [--name "My Recommendations"] [--count 30] [--search-limit 10]
+    python recommend.py <playlist_url_or_id> [--name "My Recommendations"] [--count 30]
 
 Requires SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET environment variables
 (or a .env file). Get these from https://developer.spotify.com/dashboard.
@@ -16,9 +16,8 @@ Requires SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET environment variables
 
 import argparse
 import os
-import random
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 
 import spotipy
 from dotenv import load_dotenv
@@ -93,47 +92,124 @@ def search_public_playlists(sp, track, limit=5):
         return []
 
 
-def find_recommendations(sp, input_tracks, search_limit, progress=True):
+def discover_playlists(sp, input_tracks, search_results_per_track=5):
     """
-    Find recommended songs by analyzing co-occurrence in public playlists.
+    Phase 1: Broad search to discover candidate playlists.
 
-    Samples tracks from the input playlist, searches for public playlists
-    containing those tracks, then counts how often each *other* song appears
-    across all discovered playlists.
+    Searches for public playlists for every input track, collecting only
+    playlist IDs. Counts how many different input track searches each
+    playlist appeared in (the "hit count"). This is a cheap proxy for
+    overlap before we commit to fetching full track lists.
+
+    Returns a dict mapping playlist_id -> hit_count, sorted descending.
+    """
+    hit_counts = Counter()
+    total = len(input_tracks)
+
+    for i, track in enumerate(input_tracks):
+        print(f"  [{i + 1}/{total}] Searching: "
+              f"{track['name']} - {', '.join(track['artists'])}")
+        playlist_ids = search_public_playlists(sp, track, limit=search_results_per_track)
+        # Count each playlist at most once per input track search
+        for pid in set(playlist_ids):
+            hit_counts[pid] += 1
+
+    return hit_counts
+
+
+def score_playlist(input_track_ids, input_artist_by_track, playlist_tracks):
+    """
+    Score a playlist by how well it overlaps with the input playlist.
+
+    Uses an exponential artist-diversity formula:
+        score = matching_tracks * (distinct_matching_artists ^ 2)
+
+    This heavily rewards playlists that share songs from many different
+    artists rather than many songs from a single artist.
+    """
+    matching_artists = set()
+    matching_count = 0
+
+    for track in playlist_tracks:
+        if track["id"] in input_track_ids:
+            matching_count += 1
+            artist = input_artist_by_track.get(track["id"])
+            if artist:
+                matching_artists.add(artist)
+
+    if matching_count == 0:
+        return 0, matching_count, len(matching_artists)
+
+    score = matching_count * (len(matching_artists) ** 2)
+    return score, matching_count, len(matching_artists)
+
+
+def find_recommendations(sp, input_tracks, fetch_limit=50,
+                         search_results_per_track=5):
+    """
+    Find recommended songs using a two-phase approach:
+
+    Phase 1 - Discovery (cheap): Search for every input track to find
+    public playlists. Track how many different input-track searches each
+    playlist appears in ("hit count"). Playlists with higher hit counts
+    likely share more songs with the input playlist.
+
+    Phase 2 - Evaluation (selective): Fetch full track lists only for the
+    top playlists ranked by hit count (up to fetch_limit). Compute a
+    precise overlap score using the exponential artist-diversity formula:
+        score = matching_tracks * (distinct_matching_artists ^ 2)
+    Weight each candidate song by the score of the playlist it came from.
     """
     input_track_ids = {t["id"] for t in input_tracks}
+    # Map track ID -> primary artist name for diversity scoring
+    input_artist_by_track = {t["id"]: t["artists"][0] for t in input_tracks}
 
-    # Sample tracks to search with (avoid hitting rate limits on large playlists)
-    sample_size = min(search_limit, len(input_tracks))
-    sampled_tracks = random.sample(input_tracks, sample_size)
+    # Phase 1: Discover candidate playlists with cheap search calls
+    print("\nPhase 1: Discovering candidate playlists...")
+    hit_counts = discover_playlists(sp, input_tracks, search_results_per_track)
 
-    candidate_counts = Counter()
+    if not hit_counts:
+        return Counter(), {}
+
+    print(f"\n  Found {len(hit_counts)} unique playlists.")
+    top_hit = hit_counts.most_common(1)[0][1]
+    print(f"  Best candidate appeared in {top_hit} track searches.")
+
+    # Phase 2: Fetch and score the top candidate playlists
+    top_playlists = hit_counts.most_common(fetch_limit)
+    print(f"\nPhase 2: Evaluating top {len(top_playlists)} playlists...")
+
+    candidate_scores = defaultdict(float)
     candidate_info = {}
-    seen_playlists = set()
 
-    for i, track in enumerate(sampled_tracks):
-        if progress:
-            print(f"  Searching playlists for track {i + 1}/{sample_size}: "
-                  f"{track['name']} - {', '.join(track['artists'])}")
+    for i, (pid, hits) in enumerate(top_playlists):
+        print(f"  [{i + 1}/{len(top_playlists)}] Fetching playlist (hit count: {hits})...",
+              end="", flush=True)
 
-        playlist_ids = search_public_playlists(sp, track)
+        try:
+            pl_tracks = get_playlist_tracks(sp, pid)
+        except spotipy.SpotifyException:
+            print(" skipped (error)")
+            continue
 
-        for pid in playlist_ids:
-            if pid in seen_playlists:
-                continue
-            seen_playlists.add(pid)
+        score, match_count, artist_count = score_playlist(
+            input_track_ids, input_artist_by_track, pl_tracks
+        )
 
-            try:
-                pl_tracks = get_playlist_tracks(sp, pid)
-            except spotipy.SpotifyException:
-                continue
+        print(f" {len(pl_tracks)} tracks, "
+              f"{match_count} matches across {artist_count} artists, "
+              f"score={score}")
 
-            for t in pl_tracks:
-                if t["id"] not in input_track_ids:
-                    candidate_counts[t["id"]] += 1
-                    candidate_info[t["id"]] = t
+        if score == 0:
+            continue
 
-    return candidate_counts, candidate_info
+        for t in pl_tracks:
+            if t["id"] not in input_track_ids:
+                candidate_scores[t["id"]] += score
+                candidate_info[t["id"]] = t
+
+    # Convert to Counter for .most_common() support
+    return Counter(candidate_scores), candidate_info
 
 
 def create_playlist(sp, name, track_uris, description=""):
@@ -173,10 +249,16 @@ def main():
         help="Number of recommendations to include (default: 30)",
     )
     parser.add_argument(
-        "--search-limit",
+        "--fetch-limit",
         type=int,
-        default=10,
-        help="Number of input tracks to sample for searching (default: 10)",
+        default=50,
+        help="Max number of candidate playlists to fully evaluate (default: 50)",
+    )
+    parser.add_argument(
+        "--search-results-per-track",
+        type=int,
+        default=5,
+        help="Number of playlist results per track search (default: 5)",
     )
     args = parser.parse_args()
 
@@ -185,7 +267,7 @@ def main():
 
     playlist_id = extract_playlist_id(args.playlist)
 
-    print(f"Fetching tracks from input playlist...")
+    print("Fetching tracks from input playlist...")
     input_tracks = get_playlist_tracks(sp, playlist_id)
     if not input_tracks:
         print("Error: No tracks found in the input playlist.")
@@ -196,23 +278,25 @@ def main():
     playlist_info = sp.playlist(playlist_id, fields="name")
     input_playlist_name = playlist_info["name"]
 
-    print(f"\nSearching for public playlists containing your songs...")
-    candidate_counts, candidate_info = find_recommendations(
-        sp, input_tracks, args.search_limit
+    candidate_scores, candidate_info = find_recommendations(
+        sp, input_tracks,
+        fetch_limit=args.fetch_limit,
+        search_results_per_track=args.search_results_per_track,
     )
 
-    if not candidate_counts:
-        print("Error: Could not find any recommendations. Try increasing --search-limit.")
+    if not candidate_scores:
+        print("\nError: Could not find any recommendations. Try increasing --fetch-limit.")
         sys.exit(1)
 
-    # Take the top N most frequently co-occurring songs
-    top_recommendations = candidate_counts.most_common(args.count)
+    # Take the top N highest-scored songs
+    top_recommendations = candidate_scores.most_common(args.count)
     rec_uris = [candidate_info[track_id]["uri"] for track_id, _ in top_recommendations]
 
     print(f"\nTop {len(top_recommendations)} recommendations:")
-    for rank, (track_id, count) in enumerate(top_recommendations, 1):
+    for rank, (track_id, score) in enumerate(top_recommendations, 1):
         info = candidate_info[track_id]
-        print(f"  {rank:3d}. {info['name']} - {', '.join(info['artists'])} (appeared in {count} playlists)")
+        print(f"  {rank:3d}. {info['name']} - {', '.join(info['artists'])} "
+              f"(score: {score:.0f})")
 
     output_name = args.name or f"Recommendations from {input_playlist_name}"
     description = (
