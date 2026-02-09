@@ -4,11 +4,12 @@ Generate a Spotify playlist of new song recommendations based on your existing p
 
 ## How it works
 
-1. Reads all tracks from your input Spotify playlist
-2. Samples tracks and searches for public playlists containing those songs
-3. Counts how often each new song appears across the discovered playlists
-4. Songs that appear most frequently alongside yours are the strongest recommendations
-5. Creates a new playlist on your Spotify account with the top recommendations
+The script uses a two-phase approach to find playlists with strong overlap before evaluating them:
+
+1. **Discovery phase**: Searches Spotify for public playlists containing each track from your input playlist. Tracks how many of your different songs each public playlist appeared in search results for — playlists that show up across many searches likely share multiple songs with yours.
+2. **Evaluation phase**: Fetches the full track lists of only the top candidate playlists (ranked by how many search hits they had). Computes a precise overlap score that rewards artist diversity: `score = matching_tracks * (distinct_matching_artists ^ 2)`. A playlist matching 4 of your songs from 3 different artists scores much higher than one matching 4 songs from a single artist.
+3. **Scoring**: Each candidate song accumulates score from every evaluated playlist it appears in. Songs that consistently appear in high-overlap, artist-diverse playlists rise to the top.
+4. **Output**: Creates a new playlist on your account with the top-scored recommendations.
 
 ## Setup
 
@@ -47,8 +48,11 @@ python recommend.py <playlist_url> --name "My Discovery Mix"
 # Change the number of recommendations (default: 30)
 python recommend.py <playlist_url> --count 50
 
-# Search more input tracks for broader recommendations (default: 10)
-python recommend.py <playlist_url> --search-limit 20
+# Evaluate more candidate playlists for broader recommendations
+python recommend.py <playlist_url> --fetch-limit 100
+
+# Get more search results per track during discovery
+python recommend.py <playlist_url> --search-results-per-track 10
 ```
 
 You can pass a playlist URL, a Spotify URI (`spotify:playlist:...`), or a plain playlist ID.
@@ -61,7 +65,8 @@ On first run, a browser window will open for Spotify login. The auth token is ca
 |------|---------|-------------|
 | `--name` | `Recommendations from <input playlist>` | Name of the output playlist |
 | `--count` | `30` | Number of songs to recommend |
-| `--search-limit` | `10` | Number of input tracks to sample when searching for public playlists |
+| `--fetch-limit` | `50` | Max number of candidate playlists to fully evaluate in phase 2 |
+| `--search-results-per-track` | `5` | Number of playlist results to collect per track search in phase 1 |
 
 ## License
 
